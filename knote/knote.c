@@ -15,6 +15,14 @@ MODULE_AUTHOR("Incarnation P. Lee <incarnation.p.lee@gmail.com>");
 #define KNOTE_NAME             "knote"
 #define KNOTE_DEV_COUNT        16
 #define KNOTE_SET_SIZE         4096
+#if 0
+	#define KNOTE_DEBUG
+#endif
+
+#ifndef KNOTE_DEBUG
+	#undef pr_info
+	#define pr_info(fmt, ...)
+#endif
 
 struct knote_set_list {
 	char *base;
@@ -23,8 +31,9 @@ struct knote_set_list {
 
 struct knote_dev {
 	int set_size;
-	int last_len;
+	int tail_rest;
 	struct knote_set_list *data;
+	struct knote_set_list *tail; /* last node of set list */
 	struct cdev cdev;
 };
 
@@ -38,8 +47,10 @@ int knote_open(struct inode *inode, struct file *filp)
 	retval = 0;
 	dev = container_of(inode->i_cdev, struct knote_dev, cdev);
 	if (filp) {
-		//if (filp->private_data == dev && (filp->f_mode & FMODE_WRITE))
-		//	retval = -ETXTBSY;
+		if (filp->private_data == dev && (filp->f_mode & FMODE_WRITE)) {
+			dev->tail = dev->data;
+			dev->tail_rest = 0;
+		}
 		filp->private_data = dev;
 		filp->f_pos = 0;
 	}
@@ -50,14 +61,17 @@ int knote_open(struct inode *inode, struct file *filp)
 
 static void knote_truncate(struct knote_dev *dev)
 {
-	struct knote_set_list *node, *tmp;
+	struct knote_set_list *node, *next;
 
 	if (dev) {
-		node = dev->data;
-		while (tmp = node->next, tmp) {
+		next = dev->tail->next;
+		while (node = next, node) {
+			next = node->next;
+			kfree(node->base);
 			kfree(node);
-			node = tmp;
+			pr_info("Kfree one node of knote set list.\n");
 		}
+		dev->tail->next = NULL;
 	}
 }
 
@@ -88,36 +102,122 @@ knote_set_access_by_index(struct knote_set_list *node, int index)
 	return result;
 }
 
-ssize_t knote_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos)
+static struct knote_set_list *
+knote_set_append_node(struct knote_set_list *node)
+{
+	struct knote_set_list *result;
+
+	result = node;
+	if (node) {
+		while(result->next)
+			result = result->next;
+
+		result->next = kmalloc(sizeof(*result), GFP_KERNEL);
+		if (!result->next) {
+			result = NULL;
+			goto FAIL;
+		}
+		result = result->next;
+		result->next = NULL;
+
+		result->base = kmalloc(KNOTE_SET_SIZE, GFP_KERNEL);
+		if (!result->base) {
+			kfree(result);
+			goto FAIL;
+		}
+		pr_info("Kmalloc one node of knote set list.\n");
+	}
+FAIL:
+	return result;
+}
+
+ssize_t knote_write(struct file *filp, const char __user *buf,
+	size_t count, loff_t *f_pos)
 {
 	ssize_t retval;
-	int index, rest, set_size, last_len;
-	loff_t cnt;
+	int index, rest, set_size;
 	struct knote_set_list *tmp;
+	struct knote_dev *dev;
 
 	retval = 0;
-	cnt = 0;
+	dev = kn_dev;
 
-	if (filp && buf && f_pos && kn_dev) {
-		set_size = kn_dev->set_size;
-		last_len = kn_dev->last_len;
+	if (filp && buf && f_pos && dev) {
+		set_size = dev->set_size;
 		index = *f_pos / set_size;
 		rest = *f_pos % set_size;
 
-		tmp = knote_set_access_by_index(kn_dev->data, index);
-		if (tmp) {
-			if (count > set_size - rest)
+		tmp = knote_set_access_by_index(dev->data, index);
+		if (!tmp)
+			tmp = knote_set_append_node(dev->data);
+
+		if (count > set_size - rest)
+			count = set_size - rest;
+
+		if (copy_from_user(tmp->base, buf, count)) {
+			retval = -EFAULT;
+			goto FAIL;
+		}
+
+		*f_pos += count;
+		retval = count;
+		dev->tail = tmp;
+		dev->tail_rest = count + rest;
+		pr_info("Info: Dev OPT: [ [33mWrite[0m ] %d\n", (int)count);
+	}
+
+FAIL:
+	return retval;
+}
+
+static int
+knote_set_is_over_tail(struct knote_dev *dev, struct knote_set_list *node)
+{
+	int retval;
+
+	retval = 1;
+	if (dev && node) {
+		while (node) {
+			if (dev->tail == node) {
+				retval = 0;
+				break;
+			}
+			node = node->next;
+		}
+	}
+
+	return retval;
+}
+
+ssize_t knote_read(struct file *filp, char __user *buf,
+	size_t count, loff_t *f_pos)
+{
+	ssize_t retval;
+	int index, rest, set_size, tail_rest;
+	struct knote_set_list *tmp;
+	struct knote_dev *dev;
+
+	retval = 0;
+	dev = kn_dev;
+
+	if (filp && buf && f_pos && dev) {
+		set_size = dev->set_size;
+		tail_rest = dev->tail_rest;
+		index = *f_pos / set_size;
+		rest = *f_pos % set_size;
+
+		tmp = knote_set_access_by_index(dev->data, index);
+		if (tmp && !knote_set_is_over_tail(dev, tmp)) {
+			/* handle last node of knote set list */
+			if (!tmp->next || tmp == dev->tail) {
+				if (tail_rest < rest)
+					count = 0;
+				else if (count > tail_rest - rest)
+					count = tail_rest - rest;
+			} else if (count > set_size - rest)
 				count = set_size - rest;
 
-			/* handle last node of knote set list */
-			if (!tmp->next) {
-				if (last_len < rest)
-					count = 0;
-				else
-					count = last_len - rest;
-			}
-
-			if (count && copy_to_user(buf, tmp->base, count)) {
+			if (copy_to_user(buf, tmp->base, count)) {
 				retval = -EFAULT;
 				goto FAIL;
 			}
@@ -127,7 +227,6 @@ ssize_t knote_read(struct file *filp, char __user *buf, size_t count, loff_t *f_
 			pr_info("Info: Dev OPT: [ [32mRead[0m ] %d\n",
 				(int)count);
 		}
-
 	}
 
 FAIL:
@@ -135,11 +234,11 @@ FAIL:
 }
 
 static const struct file_operations knote_fops = {
-	.owner = THIS_MODULE,
-	.open  = knote_open,
+	.owner   = THIS_MODULE,
+	.open    = knote_open,
 	.release = knote_release,
-	.read  = knote_read,
-	//.write = knote_write,
+	.read    = knote_read,
+	.write   = knote_write,
 };
 
 static void knote_destroy(struct knote_dev *dev)
@@ -169,6 +268,7 @@ static int knote_allocate(struct knote_dev *dev)
 		retval = -ENOMEM;
 		goto FAIL;
 	}
+	dev->tail = dev->data;
 
 	dev->data->next = NULL;
 	dev->data->base = kmalloc(KNOTE_SET_SIZE, GFP_KERNEL);
@@ -193,7 +293,7 @@ static int knote_setup(void)
 		goto FAIL;
 	}
 
-	kn_dev->last_len = 0;
+	kn_dev->tail_rest = 0;
 	retval = knote_allocate(kn_dev);
 
 FAIL:
