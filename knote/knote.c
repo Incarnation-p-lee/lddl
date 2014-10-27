@@ -15,7 +15,7 @@ MODULE_AUTHOR("Incarnation P. Lee <incarnation.p.lee@gmail.com>");
 #define KNOTE_NAME             "knote"
 #define KNOTE_DEV_COUNT        16
 #define KNOTE_SET_SIZE         4096
-#if 0
+#if 1
 	#define KNOTE_DEBUG
 #endif
 
@@ -39,6 +39,26 @@ struct knote_dev {
 
 static struct knote_dev *kn_dev;
 
+static int knote_file_length(struct knote_dev *dev)
+{
+	int retval;
+	int cnt;
+	struct knote_set_list *iter;
+
+	retval = 0;
+	cnt = 0;
+	if (dev) {
+		iter = dev->data;
+		while (iter != dev->tail) {
+			cnt++;
+			iter = iter->next;
+		}
+		retval = cnt * KNOTE_SET_SIZE + dev->tail_rest;
+	}
+
+	return retval;
+}
+
 int knote_open(struct inode *inode, struct file *filp)
 {
 	int retval;
@@ -47,12 +67,20 @@ int knote_open(struct inode *inode, struct file *filp)
 	retval = 0;
 	dev = container_of(inode->i_cdev, struct knote_dev, cdev);
 	if (filp) {
-		if (filp->private_data == dev && (filp->f_mode & FMODE_WRITE)) {
+                filp->private_data = dev;
+		if ((O_RDONLY == (filp->f_flags & O_ACCMODE)) ||
+			(O_RDWR == (filp->f_flags & O_ACCMODE))) {
+			/* read-only or read-write */
+			filp->f_pos = 0;
+		} else if (O_APPEND & filp->f_flags) {
+			/* write-only with append */
+			filp->f_pos = knote_file_length(dev);
+		} else {
+			/* write-only override */
 			dev->tail = dev->data;
 			dev->tail_rest = 0;
+			filp->f_pos = 0;
 		}
-		filp->private_data = dev;
-		filp->f_pos = 0;
 	}
 
 	pr_info("Info: Device operation: [ [32mOpen[0m ]\n");
@@ -154,7 +182,7 @@ ssize_t knote_write(struct file *filp, const char __user *buf,
 		if (count > set_size - rest)
 			count = set_size - rest;
 
-		if (copy_from_user(tmp->base, buf, count)) {
+		if (copy_from_user(tmp->base + rest, buf, count)) {
 			retval = -EFAULT;
 			goto FAIL;
 		}
@@ -217,7 +245,7 @@ ssize_t knote_read(struct file *filp, char __user *buf,
 			} else if (count > set_size - rest)
 				count = set_size - rest;
 
-			if (copy_to_user(buf, tmp->base, count)) {
+			if (copy_to_user(buf, tmp->base + rest, count)) {
 				retval = -EFAULT;
 				goto FAIL;
 			}
